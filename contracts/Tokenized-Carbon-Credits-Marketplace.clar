@@ -3,6 +3,8 @@
 (define-constant err-not-found (err u101))
 (define-constant err-invalid-amount (err u102))
 (define-constant err-unauthorized (err u103))
+(define-constant err-already-rated (err u104))
+(define-constant err-invalid-rating (err u105))
 
 (define-non-fungible-token carbon-credit uint)
 
@@ -30,6 +32,31 @@
 
 (define-data-var next-credit-id uint u1)
 (define-data-var next-project-id uint u1)
+
+(define-map validators
+  principal
+  {
+    registered: bool,
+    reputation: uint
+  }
+)
+
+(define-map credit-ratings
+  { credit-id: uint, validator: principal }
+  {
+    score: uint,
+    timestamp: uint
+  }
+)
+
+(define-map credit-rating-summary
+  uint
+  {
+    total-score: uint,
+    rating-count: uint,
+    average-rating: uint
+  }
+)
 
 (define-public (create-project (name (string-ascii 100)) (location (string-ascii 50)) (total-credits uint))
   (let ((project-id (var-get next-project-id)))
@@ -204,3 +231,49 @@
 
 (define-read-only (get-total-credits-by-project (project-id uint))
   (ok project-id))
+
+(define-public (register-validator)
+  (begin
+    (map-set validators tx-sender {
+      registered: true,
+      reputation: u0
+    })
+    (ok true)))
+
+(define-public (rate-credit (credit-id uint) (score uint))
+  (let ((credit (unwrap! (map-get? credits credit-id) err-not-found))
+        (validator (unwrap! (map-get? validators tx-sender) err-unauthorized))
+        (existing-rating (map-get? credit-ratings { credit-id: credit-id, validator: tx-sender }))
+        (current-summary (default-to { total-score: u0, rating-count: u0, average-rating: u0 } 
+                                     (map-get? credit-rating-summary credit-id))))
+    (asserts! (get registered validator) err-unauthorized)
+    (asserts! (and (>= score u1) (<= score u10)) err-invalid-rating)
+    (asserts! (is-none existing-rating) err-already-rated)
+    (begin
+      (map-set credit-ratings { credit-id: credit-id, validator: tx-sender } {
+        score: score,
+        timestamp: stacks-block-height
+      })
+      (let ((new-total-score (+ (get total-score current-summary) score))
+            (new-rating-count (+ (get rating-count current-summary) u1)))
+        (map-set credit-rating-summary credit-id {
+          total-score: new-total-score,
+          rating-count: new-rating-count,
+          average-rating: (/ new-total-score new-rating-count)
+        }))
+      (map-set validators tx-sender (merge validator { reputation: (+ (get reputation validator) u1) }))
+      (ok true))))
+
+(define-read-only (get-validator (validator-address principal))
+  (map-get? validators validator-address))
+
+(define-read-only (get-credit-rating (credit-id uint) (validator principal))
+  (map-get? credit-ratings { credit-id: credit-id, validator: validator }))
+
+(define-read-only (get-credit-average-rating (credit-id uint))
+  (map-get? credit-rating-summary credit-id))
+
+(define-read-only (is-validator-registered (validator-address principal))
+  (match (map-get? validators validator-address)
+    validator-data (get registered validator-data)
+    false))
