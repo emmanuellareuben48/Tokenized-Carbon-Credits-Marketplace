@@ -5,6 +5,8 @@
 (define-constant err-unauthorized (err u103))
 (define-constant err-already-rated (err u104))
 (define-constant err-invalid-rating (err u105))
+(define-constant err-credit-not-retired (err u106))
+(define-constant err-certificate-exists (err u107))
 
 (define-non-fungible-token carbon-credit uint)
 
@@ -57,6 +59,29 @@
     average-rating: uint
   }
 )
+
+(define-map offset-certificates
+  uint
+  {
+    credit-id: uint,
+    holder: principal,
+    co2-amount-tons: uint,
+    issue-date: uint,
+    project-name: (string-ascii 100),
+    verification-hash: (buff 32)
+  }
+)
+
+(define-map user-offset-totals
+  principal
+  {
+    total-co2-offset: uint,
+    certificates-count: uint,
+    first-offset-date: uint
+  }
+)
+
+(define-data-var next-certificate-id uint u1)
 
 (define-public (create-project (name (string-ascii 100)) (location (string-ascii 50)) (total-credits uint))
   (let ((project-id (var-get next-project-id)))
@@ -277,3 +302,54 @@
   (match (map-get? validators validator-address)
     validator-data (get registered validator-data)
     false))
+
+(define-public (generate-offset-certificate (credit-id uint))
+  (let ((credit (unwrap! (map-get? credits credit-id) err-not-found))
+        (project (unwrap! (map-get? projects (get project-id credit)) err-not-found))
+        (certificate-id (var-get next-certificate-id))
+        (current-totals (default-to 
+          { total-co2-offset: u0, certificates-count: u0, first-offset-date: u0 } 
+          (map-get? user-offset-totals tx-sender)))
+        (verification-hash (keccak256 (concat 
+          (concat (unwrap-panic (to-consensus-buff? credit-id)) (unwrap-panic (to-consensus-buff? tx-sender)))
+          (unwrap-panic (to-consensus-buff? stacks-block-height))))))
+    (asserts! (is-eq (get owner credit) tx-sender) err-unauthorized)
+    (asserts! (get retired credit) err-credit-not-retired)
+    (asserts! (is-none (map-get? offset-certificates certificate-id)) err-certificate-exists)
+    (begin
+      (map-set offset-certificates certificate-id {
+        credit-id: credit-id,
+        holder: tx-sender,
+        co2-amount-tons: (get amount credit),
+        issue-date: stacks-block-height,
+        project-name: (get name project),
+        verification-hash: verification-hash
+      })
+      (map-set user-offset-totals tx-sender {
+        total-co2-offset: (+ (get total-co2-offset current-totals) (get amount credit)),
+        certificates-count: (+ (get certificates-count current-totals) u1),
+        first-offset-date: (if (is-eq (get first-offset-date current-totals) u0) 
+                              stacks-block-height 
+                              (get first-offset-date current-totals))
+      })
+      (var-set next-certificate-id (+ certificate-id u1))
+      (ok certificate-id))))
+
+(define-read-only (get-offset-certificate (certificate-id uint))
+  (map-get? offset-certificates certificate-id))
+
+(define-read-only (get-user-offset-totals (user principal))
+  (map-get? user-offset-totals user))
+
+(define-read-only (verify-certificate (certificate-id uint))
+  (match (map-get? offset-certificates certificate-id)
+    certificate (let ((expected-hash (keccak256 (concat 
+                        (concat (unwrap-panic (to-consensus-buff? (get credit-id certificate))) (unwrap-panic (to-consensus-buff? (get holder certificate))))
+                        (unwrap-panic (to-consensus-buff? (get issue-date certificate)))))))
+                  (ok (is-eq (get verification-hash certificate) expected-hash)))
+    err-not-found))
+
+(define-read-only (calculate-environmental-impact (user principal))
+  (match (map-get? user-offset-totals user)
+    user-totals (ok (get total-co2-offset user-totals))
+    (ok u0)))
