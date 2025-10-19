@@ -353,3 +353,196 @@
   (match (map-get? user-offset-totals user)
     user-totals (ok (get total-co2-offset user-totals))
     (ok u0)))
+
+;; ============================================================================
+;; CARBON CREDIT AUCTION SYSTEM
+;; ============================================================================
+
+;; Auction-specific error constants
+(define-constant err-auction-not-found (err u200))
+(define-constant err-auction-expired (err u201))
+(define-constant err-auction-not-expired (err u202))
+(define-constant err-bid-too-low (err u203))
+(define-constant err-self-bid (err u204))
+(define-constant err-auction-not-active (err u205))
+(define-constant err-no-bids (err u206))
+(define-constant err-refund-failed (err u207))
+
+;; Auction data structures
+(define-map auctions
+  uint
+  {
+    credit-id: uint,
+    seller: principal,
+    starting-price: uint,
+    current-bid: uint,
+    highest-bidder: (optional principal),
+    start-height: uint,
+    end-height: uint,
+    active: bool,
+    reserve-met: bool
+  }
+)
+
+(define-map auction-bids
+  { auction-id: uint, bidder: principal }
+  {
+    amount: uint,
+    timestamp: uint,
+    refunded: bool
+  }
+)
+
+(define-map auction-history
+  uint
+  {
+    total-bids: uint,
+    final-price: uint,
+    winner: (optional principal),
+    completion-height: uint
+  }
+)
+
+(define-data-var next-auction-id uint u1)
+
+;; Create auction for a carbon credit
+(define-public (create-auction (credit-id uint) (starting-price uint) (duration-blocks uint) (reserve-price uint))
+  (let ((credit (unwrap! (map-get? credits credit-id) err-not-found))
+        (auction-id (var-get next-auction-id))
+        (end-height (+ stacks-block-height duration-blocks)))
+    (asserts! (is-eq (get owner credit) tx-sender) err-unauthorized)
+    (asserts! (not (get retired credit)) err-unauthorized)
+    (asserts! (> starting-price u0) err-invalid-amount)
+    (asserts! (> duration-blocks u0) err-invalid-amount)
+    (asserts! (>= reserve-price starting-price) err-invalid-amount)
+    (begin
+      (map-set auctions auction-id {
+        credit-id: credit-id,
+        seller: tx-sender,
+        starting-price: starting-price,
+        current-bid: starting-price,
+        highest-bidder: none,
+        start-height: stacks-block-height,
+        end-height: end-height,
+        active: true,
+        reserve-met: (is-eq reserve-price starting-price)
+      })
+      (var-set next-auction-id (+ auction-id u1))
+      (ok auction-id))))
+
+;; Place bid on auction
+(define-public (place-bid (auction-id uint) (bid-amount uint))
+  (let ((auction (unwrap! (map-get? auctions auction-id) err-auction-not-found))
+        (credit (unwrap! (map-get? credits (get credit-id auction)) err-not-found)))
+    (asserts! (get active auction) err-auction-not-active)
+    (asserts! (<= stacks-block-height (get end-height auction)) err-auction-expired)
+    (asserts! (not (is-eq tx-sender (get seller auction))) err-self-bid)
+    (asserts! (> bid-amount (get current-bid auction)) err-bid-too-low)
+    (asserts! (not (get retired credit)) err-unauthorized)
+    (begin
+      ;; Refund previous highest bidder if exists
+      (match (get highest-bidder auction)
+        prev-bidder 
+          (let ((prev-bid-data (unwrap! (map-get? auction-bids { auction-id: auction-id, bidder: prev-bidder }) err-not-found)))
+            (try! (stx-transfer? (get amount prev-bid-data) tx-sender prev-bidder))
+            (map-set auction-bids { auction-id: auction-id, bidder: prev-bidder } 
+                     (merge prev-bid-data { refunded: true })))
+        true)
+      ;; Record new bid
+      (map-set auction-bids { auction-id: auction-id, bidder: tx-sender } {
+        amount: bid-amount,
+        timestamp: stacks-block-height,
+        refunded: false
+      })
+      ;; Transfer bid amount to contract
+      (try! (stx-transfer? bid-amount tx-sender (as-contract tx-sender)))
+      ;; Update auction with new highest bid
+      (map-set auctions auction-id (merge auction {
+        current-bid: bid-amount,
+        highest-bidder: (some tx-sender),
+        reserve-met: true
+      }))
+      (ok true))))
+
+;; Complete auction and transfer credit to winner
+(define-public (complete-auction (auction-id uint))
+  (let ((auction (unwrap! (map-get? auctions auction-id) err-auction-not-found))
+        (credit (unwrap! (map-get? credits (get credit-id auction)) err-not-found)))
+    (asserts! (get active auction) err-auction-not-active)
+    (asserts! (> stacks-block-height (get end-height auction)) err-auction-not-expired)
+    (asserts! (get reserve-met auction) err-no-bids)
+    (match (get highest-bidder auction)
+      winner 
+        (begin
+          ;; Transfer credit to winner
+          (try! (nft-transfer? carbon-credit (get credit-id auction) (get seller auction) winner))
+          ;; Update credit ownership
+          (map-set credits (get credit-id auction) (merge credit { owner: winner }))
+          ;; Transfer payment to seller
+          (try! (as-contract (stx-transfer? (get current-bid auction) tx-sender (get seller auction))))
+          ;; Mark auction as completed
+          (map-set auctions auction-id (merge auction { active: false }))
+          ;; Record auction history
+          (map-set auction-history auction-id {
+            total-bids: u1, ;; Simplified - could be enhanced to count all bids
+            final-price: (get current-bid auction),
+            winner: (some winner),
+            completion-height: stacks-block-height
+          })
+          (ok winner))
+      err-no-bids)))
+
+;; Cancel auction (only by seller, only if no bids)
+(define-public (cancel-auction (auction-id uint))
+  (let ((auction (unwrap! (map-get? auctions auction-id) err-auction-not-found)))
+    (asserts! (is-eq tx-sender (get seller auction)) err-unauthorized)
+    (asserts! (get active auction) err-auction-not-active)
+    (asserts! (is-none (get highest-bidder auction)) err-unauthorized)
+    (begin
+      (map-set auctions auction-id (merge auction { active: false }))
+      (ok true))))
+
+;; Emergency refund for failed auction
+(define-public (emergency-refund (auction-id uint) (bidder principal))
+  (let ((auction (unwrap! (map-get? auctions auction-id) err-auction-not-found))
+        (bid-data (unwrap! (map-get? auction-bids { auction-id: auction-id, bidder: bidder }) err-not-found)))
+    (asserts! (not (get active auction)) err-auction-not-active)
+    (asserts! (not (get refunded bid-data)) err-refund-failed)
+    (asserts! (> stacks-block-height (+ (get end-height auction) u144)) err-auction-not-expired) ;; 24 hours after auction end
+    (begin
+      (try! (as-contract (stx-transfer? (get amount bid-data) tx-sender bidder)))
+      (map-set auction-bids { auction-id: auction-id, bidder: bidder } 
+               (merge bid-data { refunded: true }))
+      (ok true))))
+
+;; Read-only functions for auction system
+(define-read-only (get-auction (auction-id uint))
+  (map-get? auctions auction-id))
+
+(define-read-only (get-auction-bid (auction-id uint) (bidder principal))
+  (map-get? auction-bids { auction-id: auction-id, bidder: bidder }))
+
+(define-read-only (get-auction-history (auction-id uint))
+  (map-get? auction-history auction-id))
+
+(define-read-only (is-auction-active (auction-id uint))
+  (match (map-get? auctions auction-id)
+    auction (and (get active auction) (<= stacks-block-height (get end-height auction)))
+    false))
+
+(define-read-only (get-time-remaining (auction-id uint))
+  (match (map-get? auctions auction-id)
+    auction (if (<= stacks-block-height (get end-height auction))
+               (ok (- (get end-height auction) stacks-block-height))
+               (ok u0))
+    err-auction-not-found))
+
+(define-read-only (estimate-auction-value (auction-id uint))
+  (match (map-get? auctions auction-id)
+    auction (let ((time-remaining (unwrap! (get-time-remaining auction-id) err-auction-not-found))
+                  (current-bid (get current-bid auction))
+                  (time-factor (if (> time-remaining u0) 
+                                 (/ (* time-remaining u100) (- (get end-height auction) (get start-height auction)))
+                                 u0)))
+              (ok (+ current-bid (/ (* current-bid time-factor) u1000))))
+    err-auction-not-found))
