@@ -367,6 +367,95 @@
 (define-constant err-auction-not-active (err u205))
 (define-constant err-no-bids (err u206))
 (define-constant err-refund-failed (err u207))
+(define-constant err-buyback-disabled (err u208))
+(define-constant err-insufficient-treasury (err u209))
+(define-constant err-buyback-not-available (err u210))
+
+;; Treasury and buyback data structures
+(define-data-var treasury-balance uint u0)
+(define-data-var buyback-active bool false)
+(define-data-var buyback-price-per-credit uint u0)
+(define-data-var total-buybacks uint u0)
+
+(define-map buyback-history
+  uint
+  {
+    seller: principal,
+    credit-id: uint,
+    buyback-price: uint,
+    timestamp: uint
+  }
+)
+
+(define-data-var next-buyback-id uint u1)
+
+;; Initialize buyback program
+(define-public (initialize-buyback-program (initial-price uint))
+  (if (is-eq tx-sender contract-owner)
+    (begin
+      (var-set buyback-active true)
+      (var-set buyback-price-per-credit initial-price)
+      (ok true))
+    err-owner-only))
+
+;; Deposit STX to treasury
+(define-public (deposit-to-treasury (amount uint))
+  (if (is-eq tx-sender contract-owner)
+    (begin
+      (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+      (var-set treasury-balance (+ (var-get treasury-balance) amount))
+      (ok (var-get treasury-balance)))
+    err-owner-only))
+
+;; Update buyback price
+(define-public (update-buyback-price (new-price uint))
+  (if (is-eq tx-sender contract-owner)
+    (begin
+      (var-set buyback-price-per-credit new-price)
+      (ok true))
+    err-owner-only))
+
+;; Sell credit back to treasury
+(define-public (sell-to-buyback (credit-id uint))
+  (let ((credit (unwrap! (map-get? credits credit-id) err-not-found))
+        (buyback-id (var-get next-buyback-id))
+        (buyback-payout (var-get buyback-price-per-credit)))
+    (asserts! (var-get buyback-active) err-buyback-disabled)
+    (asserts! (is-eq (get owner credit) tx-sender) err-unauthorized)
+    (asserts! (not (get retired credit)) err-credit-not-retired)
+    (asserts! (> buyback-payout u0) err-buyback-not-available)
+    (asserts! (>= (var-get treasury-balance) buyback-payout) err-insufficient-treasury)
+    (begin
+      (try! (nft-transfer? carbon-credit credit-id tx-sender (as-contract tx-sender)))
+      (try! (as-contract (stx-transfer? buyback-payout tx-sender tx-sender)))
+      (map-set credits credit-id (merge credit { owner: (as-contract tx-sender), retired: false }))
+      (map-set buyback-history buyback-id {
+        seller: tx-sender,
+        credit-id: credit-id,
+        buyback-price: buyback-payout,
+        timestamp: stacks-block-height
+      })
+      (var-set treasury-balance (- (var-get treasury-balance) buyback-payout))
+      (var-set total-buybacks (+ (var-get total-buybacks) u1))
+      (var-set next-buyback-id (+ buyback-id u1))
+      (ok true))))
+
+;; Read-only: Get treasury balance
+(define-read-only (get-treasury-balance)
+  (ok (var-get treasury-balance)))
+
+;; Read-only: Get buyback program status
+(define-read-only (get-buyback-status)
+  (ok {
+    active: (var-get buyback-active),
+    price-per-credit: (var-get buyback-price-per-credit),
+    treasury-balance: (var-get treasury-balance),
+    total-buybacks: (var-get total-buybacks)
+  }))
+
+;; Read-only: Get buyback history entry
+(define-read-only (get-buyback-history (buyback-id uint))
+  (map-get? buyback-history buyback-id))
 
 ;; Auction data structures
 (define-map auctions
